@@ -1,0 +1,30 @@
+[package]
+name = "sootmark-shell"
+version = "0.2.2"
+edition = "2021"
+rust-version = "1.80"
+description = "Windows shell items, LNK files (MS-SHLLINK), jump lists and compound files (MS-CFB), from the public documentation."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Sootmark/shell"
+homepage = "https://sootmark.com"
+keywords = ["forensics", "dfir", "lnk", "jumplist", "windows"]
+# Sources only: test fixtures stay in the repository.
+include = ["/src", "/README.md", "/LICENSE-APACHE", "/LICENSE-MIT"]
+
+[lib]
+name = "shell"
+
+[dev-dependencies]
+proptest = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"

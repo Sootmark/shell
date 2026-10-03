@@ -1,0 +1,2 @@
+# Tool, artifact and format names, not code.
+doc-valid-idents = ["LECmd", "JLECmd", "NetBIOS", "LinkInfo", "SBECmd", "ShellBags", "UsrClass", ".."]
