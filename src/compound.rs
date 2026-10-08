@@ -16,6 +16,8 @@ const SIGNATURE: [u8; 8] = [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
 const END_OF_CHAIN: u32 = 0xffff_fffe;
 const FREE: u32 = 0xffff_ffff;
 const NO_STREAM: u32 = 0xffff_ffff;
+/// Bytes of a mini sector.
+const MINI_SECTOR_SIZE: usize = 64;
 
 /// Why a compound file couldn't be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,7 +166,9 @@ impl<'a> CompoundFile<'a> {
     fn chain(&self, start: u32, size: Option<u64>) -> Result<Vec<u8>, Error> {
         let mut out = Vec::new();
         let mut current = start;
-        let limit = self.fat.len() + 1;
+        // A chain visits each sector of the file at most once: more steps
+        // mean it loops, and copying on would amplify a small file.
+        let limit = self.fat.len().min(self.data.len() / self.sector) + 1;
         for _ in 0..limit {
             if current == END_OF_CHAIN || current == FREE {
                 break;
@@ -194,14 +198,16 @@ impl<'a> CompoundFile<'a> {
     fn mini_chain(&self, start: u32, size: u64) -> Result<Vec<u8>, Error> {
         let mut out = Vec::new();
         let mut current = start;
-        for _ in 0..=self.mini_fat.len() {
+        let limit = self
+            .mini_fat
+            .len()
+            .min(self.mini_stream.len() / MINI_SECTOR_SIZE);
+        for _ in 0..=limit {
             if current == END_OF_CHAIN || current == FREE || out.len() as u64 >= size {
                 break;
             }
-            let at = current as usize * 64;
-            let bytes = self
-                .mini_stream
-                .get(at..at + 64)
+            let bytes = span(current as usize, MINI_SECTOR_SIZE)
+                .and_then(|range| self.mini_stream.get(range))
                 .ok_or_else(|| error(format!("mini sector {current} outside the mini stream")))?;
             out.extend_from_slice(bytes);
             current = *self
@@ -237,9 +243,37 @@ impl<'a> CompoundFile<'a> {
 
 /// Sector `n` (sector 0 follows the 512-byte header).
 fn sector_bytes(data: &[u8], sector: usize, n: u32) -> Result<&[u8], Error> {
-    let at = (n as usize + 1)
-        .checked_mul(sector)
+    let range = (n as usize)
+        .checked_add(1)
+        .and_then(|index| span(index, sector))
         .ok_or_else(|| error("sector number overflows"))?;
-    data.get(at..at + sector)
+    data.get(range)
         .ok_or_else(|| error(format!("sector {n} past the end of the file")))
+}
+
+/// The bytes of block `index` of `size`-byte blocks, if its end fits in a
+/// `usize` (it may not on 32-bit targets).
+fn span(index: usize, size: usize) -> Option<core::ops::Range<usize>> {
+    let start = index.checked_mul(size)?;
+    Some(start..start.checked_add(size)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_block_whose_end_overflows_has_no_span() {
+        assert_eq!(span(2, 512), Some(1024..1536));
+        assert_eq!(span(usize::MAX / 512, 512), None);
+        assert_eq!(span(usize::MAX, 1), None);
+    }
+
+    #[test]
+    fn a_sector_past_the_end_is_an_error() {
+        let data = [0u8; 1024];
+        assert_eq!(sector_bytes(&data, 512, 0).map(<[u8]>::len), Ok(512));
+        assert!(sector_bytes(&data, 512, 1).is_err());
+        assert!(sector_bytes(&data, 512, u32::MAX).is_err());
+    }
 }
