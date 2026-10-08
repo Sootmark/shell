@@ -57,7 +57,8 @@ pub struct Automatic {
     pub version: u32,
     /// The entries, in stream order.
     pub destinations: Vec<Destination>,
-    /// Entries or links that couldn't be read, and why.
+    /// Damage to the compound file's directory, and entries or links that
+    /// couldn't be read, and why.
     pub problems: Vec<String>,
 }
 
@@ -71,7 +72,7 @@ pub fn automatic(data: &[u8]) -> Result<Automatic, compound::Error> {
     let mut list = Automatic {
         version: 0,
         destinations: Vec::new(),
-        problems: Vec::new(),
+        problems: file.problems.clone(),
     };
     let dest_list = match file.stream("DestList") {
         Ok(Some(d)) if d.len() >= 32 => d,

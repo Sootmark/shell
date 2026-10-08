@@ -3,12 +3,17 @@
 //! 97–2003 documents, MSI packages and `Thumbs.db`.
 //!
 //! A 512-byte header, then sectors (512 or 4,096 bytes) chained by a file
-//! allocation table; a directory of 128-byte entries (a red-black tree by
-//! name, read here as a flat list); streams smaller than the cutoff (4,096
+//! allocation table; a directory of 128-byte entries, the children of each
+//! storage a red-black tree by name; streams smaller than the cutoff (4,096
 //! bytes) live in 64-byte mini sectors inside the root entry's stream.
-//! Every chain is bounded: a looping or truncated table is an error.
+//! Every chain is bounded: a looping or truncated table is an error. The
+//! tree is walked down from the root to give each entry its parent and
+//! path; each entry is reached at most once, so a looping or damaged link
+//! is a problem and the walk goes on.
 
 use core::fmt;
+
+use common::time::Ts;
 
 use crate::{u16_at, u32_at, u64_at};
 
@@ -16,6 +21,13 @@ const SIGNATURE: [u8; 8] = [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
 const END_OF_CHAIN: u32 = 0xffff_fffe;
 const FREE: u32 = 0xffff_ffff;
 const NO_STREAM: u32 = 0xffff_ffff;
+/// Bytes of a directory entry.
+const DIRECTORY_ENTRY_SIZE: usize = 128;
+/// Directory entry types.
+const UNUSED: u8 = 0;
+const STORAGE: u8 = 1;
+const STREAM: u8 = 2;
+const ROOT: u8 = 5;
 /// Bytes of a mini sector.
 const MINI_SECTOR_SIZE: usize = 64;
 
@@ -51,8 +63,30 @@ pub struct Entry {
     start: u32,
     /// Its size in bytes.
     pub size: u64,
-    /// Modification time (FILETIME; 0 when not recorded).
-    pub modified: u64,
+    /// When it was created: storages; `None` when not recorded, as for
+    /// streams and usually the root.
+    pub created: Option<Ts>,
+    /// When it was last modified: storages and the root; `None` when not
+    /// recorded, as for streams.
+    pub modified: Option<Ts>,
+    /// The storage holding it, as an index into [`CompoundFile::entries`]:
+    /// `None` for the root, and for an entry the tree doesn't reach from the
+    /// root.
+    pub parent: Option<usize>,
+    /// The names from the root's down to its own, joined by `/` (which
+    /// MS-CFB forbids in names): `Root Entry/\u{5}SummaryInformation`. An
+    /// entry the tree doesn't reach from the root has its name alone.
+    pub path: String,
+}
+
+/// A directory entry's links, by directory entry number.
+#[derive(Debug, Clone, Copy)]
+struct Links {
+    /// Its siblings in its storage's tree.
+    left: u32,
+    right: u32,
+    /// The top of a storage's own tree of children.
+    child: u32,
 }
 
 /// An opened compound file.
@@ -66,6 +100,10 @@ pub struct CompoundFile<'a> {
     cutoff: u64,
     /// Its directory entries, in directory order.
     pub entries: Vec<Entry>,
+    /// Damage to the directory tree: links to missing or unused entries,
+    /// entries linked twice (a loop), entries the root doesn't reach. The
+    /// rest of the file still reads.
+    pub problems: Vec<String>,
 }
 
 impl<'a> CompoundFile<'a> {
@@ -119,20 +157,34 @@ impl<'a> CompoundFile<'a> {
             mini_stream: Vec::new(),
             cutoff,
             entries: Vec::new(),
+            problems: Vec::new(),
         };
         let directory = file.chain(directory_start, None)?;
-        for raw in directory.chunks_exact(128) {
+        // Directory entry number to index in `entries`, and each entry's links.
+        let mut indexes = Vec::new();
+        let mut links = Vec::new();
+        for raw in directory.chunks_exact(DIRECTORY_ENTRY_SIZE) {
             let kind = raw[66];
-            if kind == 0 {
+            if kind == UNUSED {
+                indexes.push(None);
                 continue;
             }
+            indexes.push(Some(file.entries.len()));
+            let link = |at| u32_at(raw, at).unwrap_or(NO_STREAM);
+            links.push(Links {
+                left: link(68),
+                right: link(72),
+                child: link(76),
+            });
             let name_len = usize::from(u16_at(raw, 64).unwrap_or(0)).min(64);
             let units: Vec<u16> = raw[..name_len.saturating_sub(2)]
                 .chunks_exact(2)
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
+            let name = String::from_utf16_lossy(&units);
             file.entries.push(Entry {
-                name: String::from_utf16_lossy(&units),
+                path: name.clone(),
+                name,
                 kind,
                 start: u32_at(raw, 116).unwrap_or(END_OF_CHAIN),
                 // Version 3 files keep only the low 32 bits meaningful.
@@ -141,17 +193,20 @@ impl<'a> CompoundFile<'a> {
                 } else {
                     u64_at(raw, 120).unwrap_or(0)
                 },
-                modified: u64_at(raw, 108).unwrap_or(0),
+                created: filetime(u64_at(raw, 100).unwrap_or(0)),
+                modified: filetime(u64_at(raw, 108).unwrap_or(0)),
+                parent: None,
             });
         }
         let root = file
             .entries
             .iter()
-            .find(|e| e.kind == 5)
-            .cloned()
+            .position(|e| e.kind == ROOT)
             .ok_or_else(|| error("no root entry"))?;
-        if root.start < END_OF_CHAIN && root.size > 0 {
-            file.mini_stream = file.chain(root.start, Some(root.size))?;
+        file.problems = place(&mut file.entries, &indexes, &links, root);
+        let (start, size) = (file.entries[root].start, file.entries[root].size);
+        if start < END_OF_CHAIN && size > 0 {
+            file.mini_stream = file.chain(start, Some(size))?;
         }
         if mini_fat_start < END_OF_CHAIN {
             let raw = file.chain(mini_fat_start, None)?;
@@ -222,23 +277,93 @@ impl<'a> CompoundFile<'a> {
         Ok(out)
     }
 
-    /// The stream named `name`, if there is one.
+    /// The first stream named `name` in directory order, in any storage
+    /// (its [`Entry::path`] tells them apart; read one with
+    /// [`contents`](Self::contents)), if there is one.
     ///
     /// # Errors
     /// When its chain is damaged.
     pub fn stream(&self, name: &str) -> Result<Option<Vec<u8>>, Error> {
-        let Some(entry) = self.entries.iter().find(|e| e.kind == 2 && e.name == name) else {
-            return Ok(None);
-        };
-        if entry.size == 0 || entry.start == NO_STREAM {
-            return Ok(Some(Vec::new()));
-        }
-        if entry.size < self.cutoff {
-            self.mini_chain(entry.start, entry.size).map(Some)
+        self.entries
+            .iter()
+            .find(|e| e.kind == STREAM && e.name == name)
+            .map(|entry| self.contents(entry))
+            .transpose()
+    }
+
+    /// A stream's bytes (none for a storage or the root).
+    ///
+    /// # Errors
+    /// When its chain is damaged.
+    pub fn contents(&self, entry: &Entry) -> Result<Vec<u8>, Error> {
+        if entry.kind != STREAM || entry.size == 0 || entry.start == NO_STREAM {
+            Ok(Vec::new())
+        } else if entry.size < self.cutoff {
+            self.mini_chain(entry.start, entry.size)
         } else {
-            self.chain(entry.start, Some(entry.size)).map(Some)
+            self.chain(entry.start, Some(entry.size))
         }
     }
+}
+
+/// Each entry's parent and path, walking the tree down from `root`; damage
+/// returned as problems. `indexes` maps directory entry numbers to indexes
+/// in `entries` (`None` for unused entries); `links` follows `entries`.
+/// Each entry is placed at most once, so the walk takes no more steps than
+/// three per entry, whatever the links say.
+fn place(
+    entries: &mut [Entry],
+    indexes: &[Option<usize>],
+    links: &[Links],
+    root: usize,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut placed = vec![false; entries.len()];
+    placed[root] = true;
+    let mut storages = vec![root];
+    while let Some(storage) = storages.pop() {
+        let mut pending = vec![links[storage].child];
+        while let Some(number) = pending.pop() {
+            if number == NO_STREAM {
+                continue;
+            }
+            let Some(index) = indexes.get(number as usize).copied().flatten() else {
+                problems.push(format!(
+                    "{}: link to missing or unused directory entry {number}",
+                    entries[storage].path
+                ));
+                continue;
+            };
+            if core::mem::replace(&mut placed[index], true) {
+                problems.push(format!(
+                    "{}: directory entry {number} linked twice",
+                    entries[storage].path
+                ));
+                continue;
+            }
+            let path = format!("{}/{}", entries[storage].path, entries[index].name);
+            let entry = &mut entries[index];
+            entry.parent = Some(storage);
+            entry.path = path;
+            pending.extend([links[index].left, links[index].right]);
+            if matches!(entry.kind, STORAGE | ROOT) {
+                storages.push(index);
+            }
+        }
+    }
+    let unreached = placed.iter().filter(|&&reached| !reached).count();
+    if unreached > 0 {
+        problems.push(format!(
+            "{unreached} of {} directory entries not reached from the root",
+            entries.len()
+        ));
+    }
+    problems
+}
+
+/// A FILETIME, `None` when zero (not recorded).
+fn filetime(raw: u64) -> Option<Ts> {
+    (raw != 0).then(|| Ts::from_filetime(raw))
 }
 
 /// Sector `n` (sector 0 follows the 512-byte header).
@@ -267,6 +392,155 @@ mod tests {
         assert_eq!(span(2, 512), Some(1024..1536));
         assert_eq!(span(usize::MAX / 512, 512), None);
         assert_eq!(span(usize::MAX, 1), None);
+    }
+
+    const NONE: u32 = NO_STREAM;
+
+    fn entry(name: &str, kind: u8) -> Entry {
+        Entry {
+            name: name.to_owned(),
+            kind,
+            start: END_OF_CHAIN,
+            size: 0,
+            created: None,
+            modified: None,
+            parent: None,
+            path: name.to_owned(),
+        }
+    }
+
+    fn links(left: u32, right: u32, child: u32) -> Links {
+        Links { left, right, child }
+    }
+
+    /// `entries` placed, one per directory entry number (none unused).
+    fn placed(entries: &mut [Entry], links: &[Links]) -> Vec<String> {
+        let indexes: Vec<Option<usize>> = (0..entries.len()).map(Some).collect();
+        place(entries, &indexes, links, 0)
+    }
+
+    fn paths(entries: &[Entry]) -> Vec<(&str, Option<usize>)> {
+        entries
+            .iter()
+            .map(|e| (e.path.as_str(), e.parent))
+            .collect()
+    }
+
+    #[test]
+    fn every_entry_gets_its_parent_and_path() {
+        // Root: B (left A, right C); C is a storage holding D.
+        let mut entries = [
+            entry("Root Entry", ROOT),
+            entry("A", STREAM),
+            entry("B", STREAM),
+            entry("C", STORAGE),
+            entry("D", STREAM),
+        ];
+        let links = [
+            links(NONE, NONE, 2),
+            links(NONE, NONE, NONE),
+            links(1, 3, NONE),
+            links(NONE, NONE, 4),
+            links(NONE, NONE, NONE),
+        ];
+        assert_eq!(placed(&mut entries, &links), Vec::<String>::new());
+        assert_eq!(
+            paths(&entries),
+            [
+                ("Root Entry", None),
+                ("Root Entry/A", Some(0)),
+                ("Root Entry/B", Some(0)),
+                ("Root Entry/C", Some(0)),
+                ("Root Entry/C/D", Some(3)),
+            ]
+        );
+    }
+
+    #[test]
+    fn unused_entries_are_skipped_by_number() {
+        // Directory entry 1 is unused: number 2 is the second entry kept.
+        let mut entries = [entry("Root Entry", ROOT), entry("A", STREAM)];
+        let links = [links(NONE, NONE, 2), links(NONE, NONE, NONE)];
+        let problems = place(&mut entries, &[Some(0), None, Some(1)], &links, 0);
+        assert_eq!(problems, Vec::<String>::new());
+        assert_eq!(entries[1].path, "Root Entry/A");
+    }
+
+    #[test]
+    fn a_loop_is_walked_once_and_reported() {
+        // A storage whose child links back to it, and to the root.
+        let mut entries = [entry("Root Entry", ROOT), entry("S", STORAGE)];
+        let links = [links(NONE, NONE, 1), links(0, 1, 1)];
+        assert_eq!(
+            placed(&mut entries, &links),
+            [
+                "Root Entry: directory entry 1 linked twice",
+                "Root Entry: directory entry 0 linked twice",
+                "Root Entry/S: directory entry 1 linked twice",
+            ]
+        );
+        assert_eq!(
+            paths(&entries),
+            [("Root Entry", None), ("Root Entry/S", Some(0))]
+        );
+    }
+
+    #[test]
+    fn missing_unused_and_unreached_entries_are_problems() {
+        let mut entries = [
+            entry("Root Entry", ROOT),
+            entry("A", STREAM),
+            entry("Orphan", STREAM),
+        ];
+        let links = [
+            links(NONE, NONE, 1),
+            links(7, 3, NONE),
+            links(NONE, NONE, NONE),
+        ];
+        let indexes = [Some(0), Some(1), Some(2), None];
+        assert_eq!(
+            place(&mut entries, &indexes, &links, 0),
+            [
+                "Root Entry: link to missing or unused directory entry 3",
+                "Root Entry: link to missing or unused directory entry 7",
+                "1 of 3 directory entries not reached from the root",
+            ]
+        );
+        assert_eq!(
+            paths(&entries),
+            [
+                ("Root Entry", None),
+                ("Root Entry/A", Some(0)),
+                ("Orphan", None)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_stream_has_no_children() {
+        let mut entries = [
+            entry("Root Entry", ROOT),
+            entry("A", STREAM),
+            entry("B", STREAM),
+        ];
+        let links = [
+            links(NONE, NONE, 1),
+            links(NONE, NONE, 2),
+            links(NONE, NONE, NONE),
+        ];
+        assert_eq!(
+            placed(&mut entries, &links),
+            ["1 of 3 directory entries not reached from the root"]
+        );
+    }
+
+    #[test]
+    fn a_zero_filetime_is_not_recorded() {
+        assert_eq!(filetime(0), None);
+        assert_eq!(
+            filetime(130_131_449_897_040_000).and_then(|t| t.to_iso8601()),
+            Some("2013-05-16T02:29:49.7040000Z".to_owned())
+        );
     }
 
     #[test]

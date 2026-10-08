@@ -1,6 +1,6 @@
 [package]
 name = "sootmark-shell"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Windows shell items, LNK files (MS-SHLLINK), jump lists and compound files (MS-CFB), from the public documentation."
@@ -13,6 +13,9 @@ include = ["/src", "/README.md", "/LICENSE-APACHE", "/LICENSE-MIT"]
 
 [lib]
 name = "shell"
+
+[dependencies]
+common = { package = "sootmark-common", version = "0.3.7" }
 
 [dev-dependencies]
 proptest = "1"

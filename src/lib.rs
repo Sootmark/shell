@@ -3,9 +3,9 @@
 //! ([`jumplist`]) and the compound files they're stored in ([`compound`]).
 //!
 //! Written from the public documentation: libyal's "Windows Shell Item
-//! format" and "Jump lists format", Microsoft's MS-SHLLINK and MS-CFB. No
-//! dependencies; every read is bounds-checked and damage is reported,
-//! never a panic.
+//! format" and "Jump lists format", Microsoft's MS-SHLLINK and MS-CFB. One
+//! dependency, its sibling `sootmark-common` (times); every read is
+//! bounds-checked and damage is reported, never a panic.
 
 pub mod compound;
 pub mod item;
